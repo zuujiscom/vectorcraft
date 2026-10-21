@@ -290,8 +290,8 @@ fn announced_areas_stay_held_while_their_app_is_paused() {
     assert_eq!(restored(b.execute("file.recovery.restore", &json!({})).unwrap()), 0);
     assert!(b.execute("file.recovery.discard", &json!({"file": a_file})).unwrap_err().to_string().contains("running"));
     assert_eq!(copies(store.as_ref()), ["Untitled-1-1"]);
-    // A crashes: the browser releases its lock, and its copies are offered once its heartbeat is
-    // stale too.
+    // A crashes: the browser releases its lock, and its copies are offered at once, though its
+    // heartbeat is fresh (a reload comes back to them).
     drop(a);
     assert_eq!(offered(&mut b), ["Untitled-1"]);
     assert_eq!(restored(b.execute("file.recovery.restore", &json!({})).unwrap()), 1);

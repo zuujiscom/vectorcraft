@@ -107,7 +107,9 @@ pub trait RecoveryStore: Send + Sync {
     }
     /// Stores without locks: does a running app hold area `area` by [`RecoveryStore::announce`]?
     /// `None`: the store can't tell (heartbeats alone decide). A store that can tell but isn't sure
-    /// right now says `Some(true)`: a copy kept loses nothing, one deleted may.
+    /// right now says `Some(true)`: a copy kept loses nothing, one deleted may. `Some(false)` means
+    /// it is sure nobody holds the area (its app is gone, whatever its heartbeat says), so a reload
+    /// or a crash has its copies offered at once instead of after three intervals.
     fn announced(&self, _area: &str) -> Option<bool> {
         None
     }
@@ -840,7 +842,7 @@ enum Owner {
 /// Whose `area` of `store` is. A gone app's area is held by the caller (its lock in `hold` until
 /// dropped) and, with `take` in a store without locks, taken over with a fresh heartbeat, so
 /// another app leaves it alone meanwhile. In a store without locks an area is gone only when
-/// nothing says its app runs: no announcement (or the store can't tell) and no heartbeat for three
+/// nothing says its app runs: no announcement where the store can tell, else no heartbeat for three
 /// intervals but the one this session wrote taking it over.
 fn owner(s: &mut Session, store: &dyn RecoveryStore, area: &str, hold: &mut Vec<Hold>, take: bool) -> Owner {
     if s.recovery.own.as_ref().is_some_and(|o| o.area == area && o.store.location() == store.location()) {
@@ -853,7 +855,11 @@ fn owner(s: &mut Session, store: &dyn RecoveryStore, area: &str, hold: &mut Vec<
         }
         Ok(Lock::Busy) | Err(_) => Owner::Running,
         Ok(Lock::Unsupported) => {
-            if store.announced(area).unwrap_or(false) || beating(store, area, stale_after(s), s.recovery.adopted.get(area).copied()) {
+            let running = match store.announced(area) {
+                Some(held) => held,
+                None => beating(store, area, stale_after(s), s.recovery.adopted.get(area).copied()),
+            };
+            if running {
                 return Owner::Running;
             }
             // Best effort: without it another app might offer the copies too, which loses nothing.

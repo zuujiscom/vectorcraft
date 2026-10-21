@@ -57,8 +57,32 @@ struct Host {
     restarts: u32,
 }
 
+thread_local! {
+    /// Some open document has changes that aren't saved: leaving the page asks first.
+    static UNSAVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Ask "Leave site?" when the page is closed or reloaded with unsaved changes. The recovery
+/// copies make a lost page recoverable, but a reload the user didn't mean is better asked about.
+fn guard_unload() {
+    let Some(window) = web_sys::window() else { return };
+    let on_unload = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::BeforeUnloadEvent)>::new(move |e: web_sys::BeforeUnloadEvent| {
+        if UNSAVED.with(std::cell::Cell::get) {
+            e.prevent_default();
+            // Older browsers ask only when returnValue is set.
+            e.set_return_value("unsaved changes");
+        }
+    });
+    if let Err(e) = window.add_event_listener_with_callback("beforeunload", on_unload.as_ref().unchecked_ref()) {
+        log::error!("no unsaved-changes guard: {e:?}");
+    }
+    // The listener lives as long as the page.
+    on_unload.forget();
+}
+
 pub fn start() {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
+    guard_unload();
     let Some(canvas) = element(CANVAS_ID).and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok()) else {
         log::error!("missing <canvas id=\"{CANVAS_ID}\">");
         return;
@@ -365,6 +389,7 @@ impl eframe::App for WebShell {
             self.restart(&why);
         }
         let Some(app) = &mut self.app else { return };
+        UNSAVED.with(|u| u.set(app.session.documents().iter().any(|d| d.is_dirty())));
         let pasted = self.host.pasted.borrow_mut().flavour.take();
         if let Some((f, held)) = pasted {
             app.paste_from_host(ctx, f, held);
