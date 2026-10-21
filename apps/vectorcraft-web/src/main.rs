@@ -22,6 +22,8 @@ mod api;
 mod fonts;
 #[cfg(target_arch = "wasm32")]
 mod locks;
+#[cfg(target_arch = "wasm32")]
+mod browser_store;
 #[cfg(any(target_arch = "wasm32", test))]
 mod pencil;
 #[cfg(any(target_arch = "wasm32", test))]

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use vectorcraft_engine::Session;
 use vectorcraft_engine::cmd::clipboard::{FILE_HEAD, Flavour, PASTE_ORDER, file_flavour, is_address};
 use vectorcraft_engine::cmd::fileio;
-use vectorcraft_engine::cmd::recovery::{self, Hold, RecoveryStore};
+use vectorcraft_engine::cmd::recovery;
 use vectorcraft_ui_egui::graphics::GraphicsLoss;
 use vectorcraft_ui_egui::i18n;
 use vectorcraft_ui_egui::place::{DropTarget, PlaceArrival, PlaceInbox};
@@ -16,6 +16,7 @@ use vectorcraft_ui_egui::print::{PrintJob, PrintService, Printer};
 use vectorcraft_ui_egui::{Services, VectorcraftApp};
 use wasm_bindgen::JsCast as _;
 
+use crate::browser_store::BrowserStore;
 use crate::locks::WebLocks;
 use crate::pencil::SharedPointers;
 
@@ -52,7 +53,7 @@ struct Host {
     pointers: SharedPointers,
     /// The page's Web Locks for Data Recovery, started once before the first frame: a graphics
     /// restart keeps them, so the tab stays the owner of its recovery area.
-    locks: Option<WebLocks>,
+    store: BrowserStore,
     /// Graphics restarts so far.
     restarts: u32,
 }
@@ -90,7 +91,7 @@ pub fn start() {
     detect_language();
     wasm_bindgen_futures::spawn_local(async move {
         // Before the first frame, which looks for copies a crash left behind.
-        let locks = WebLocks::start(RECOVERY_PREFIX).await;
+        let store = BrowserStore::open(WebLocks::start(RECOVERY_PREFIX).await).await;
         // Fallback fonts the first frame needs (Noto Sans Arabic), fetched while the loading text
         // shows; the rest load in the background once the app runs.
         crate::fonts::load_startup_fonts().await;
@@ -101,7 +102,7 @@ pub fn start() {
             drag: DragPos::default(),
             pasted: Rc::default(),
             pointers: SharedPointers::default(),
-            locks,
+            store,
             restarts: 0,
         };
         track_paste(&host.pasted);
@@ -140,7 +141,7 @@ async fn run(host: Host, canvas: web_sys::HtmlCanvasElement, moving: Option<Movi
                     rs.device.set_device_lost_callback(move |reason, msg| loss.report(&ctx, format!("{reason:?}: {msg}")));
                 }
                 host.pasted.borrow_mut().ctx = Some(ctx.clone());
-                let services = services(host.inbox.clone(), host.place_inbox.clone(), ctx.clone(), host.locks.clone());
+                let services = services(host.inbox.clone(), host.place_inbox.clone(), ctx.clone(), host.store.clone());
                 let app = match taken.borrow_mut().take() {
                     Some(mut app) => {
                         // The old services asked the old context for frames.
@@ -438,7 +439,7 @@ impl eframe::App for WebShell {
     }
 }
 
-fn services(inbox: Inbox, place_inbox: PlaceInbox, ctx: egui::Context, locks: Option<WebLocks>) -> Services {
+fn services(inbox: Inbox, place_inbox: PlaceInbox, ctx: egui::Context, store: BrowserStore) -> Services {
     let open_inbox = inbox.clone();
     let picked = place_inbox.clone();
     let place_ctx = ctx.clone();
@@ -485,7 +486,7 @@ fn services(inbox: Inbox, place_inbox: PlaceInbox, ctx: egui::Context, locks: Op
         // A download that couldn't be started fails the save or export it is for (#1693).
         download: Some(Box::new(|name: &str, bytes: &[u8]| download(name, bytes).inspect_err(|e| log::error!("download of {name} failed: {e}")))),
         inbox: Some(inbox),
-        recovery_store: Some(Arc::new(BrowserStore { locks })),
+        recovery_store: Some(Arc::new(store)),
         // File → Print: the browser's print dialog.
         print: Some(Box::new(BrowserPrint)),
         ..Default::default()
@@ -527,55 +528,10 @@ fn eye_dropper(ctx: egui::Context) -> Option<vectorcraft_ui_egui::screen_color::
     }))
 }
 
-/// Data Recovery's store on the web: the browser's local storage (kept across visits and shared by
-/// the site's tabs), each entry as base64 under [`RECOVERY_PREFIX`]`<area>/<name>`. It has no
-/// locks: each tab holds its area with a heartbeat, judged by the browser's clock, and with a Web
-/// Lock named after it where the browser has them (`locks`), which a tab whose timers are paused
-/// in the background keeps.
-struct BrowserStore {
-    locks: Option<WebLocks>,
-}
-
-const RECOVERY_PREFIX: &str = "vectorcraft-recovery/";
+const RECOVERY_PREFIX: &str = crate::browser_store::RECOVERY_PREFIX;
 
 fn js_err(e: wasm_bindgen::JsValue) -> String {
     format!("{e:?}")
-}
-
-fn local_storage() -> Result<web_sys::Storage, String> {
-    web_sys::window().ok_or("no window")?.local_storage().map_err(js_err)?.ok_or_else(|| "browser storage is turned off".into())
-}
-
-impl RecoveryStore for BrowserStore {
-    fn list(&self) -> Result<Vec<String>, String> {
-        let s = local_storage()?;
-        let n = s.length().map_err(js_err)?;
-        Ok((0..n).filter_map(|i| s.key(i).ok().flatten()).filter_map(|k| k.strip_prefix(RECOVERY_PREFIX).map(str::to_string)).collect())
-    }
-    fn read(&self, name: &str) -> Result<Vec<u8>, String> {
-        let text = local_storage()?.get_item(&format!("{RECOVERY_PREFIX}{name}")).map_err(js_err)?;
-        text.and_then(|t| vectorcraft_format::base64_decode(&t)).ok_or_else(|| format!("{name}: no such recovery entry"))
-    }
-    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
-        local_storage()?
-            .set_item(&format!("{RECOVERY_PREFIX}{name}"), &vectorcraft_format::base64_encode(bytes))
-            .map_err(|e| format!("browser storage is full or turned off: {}", js_err(e)))
-    }
-    fn remove(&self, name: &str) -> Result<(), String> {
-        local_storage()?.remove_item(&format!("{RECOVERY_PREFIX}{name}")).map_err(js_err)
-    }
-    fn location(&self) -> String {
-        "browser storage".into()
-    }
-    fn now(&self) -> Option<i64> {
-        Some((js_sys::Date::now() / 1000.0) as i64)
-    }
-    fn announce(&self, area: &str) -> Option<Hold> {
-        self.locks.as_ref()?.hold(area)
-    }
-    fn announced(&self, area: &str) -> Option<bool> {
-        self.locks.as_ref().map(|l| l.held(area))
-    }
 }
 
 /// Trigger a browser download of `bytes` named after the last component of `path`.
