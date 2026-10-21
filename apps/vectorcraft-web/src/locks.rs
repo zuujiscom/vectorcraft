@@ -88,10 +88,19 @@ impl WebLocks {
         Some(())
     }
 
-    /// Does a tab hold `area`'s lock? Yes when the last snapshot is too old to tell.
+    /// Does a tab hold `area`'s lock? Yes when the last snapshot is too old to tell, or the area
+    /// is newer than it (an area is named `<Unix seconds>-<n>` after its creation, and its tab
+    /// takes the lock then): the snapshot can't have seen that one. Any other area missing from a
+    /// fresh snapshot is gone, however recent its heartbeat: a reloaded or crashed tab's copies
+    /// are offered at once.
     pub fn held(&self, area: &str) -> bool {
         let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        js_sys::Date::now() - seen.0 > FRESH_MS || seen.1.contains(area)
+        if js_sys::Date::now() - seen.0 > FRESH_MS || seen.1.contains(area) {
+            return true;
+        }
+        let created = area.split('-').next().and_then(|s| s.parse::<f64>().ok());
+        // A second of slack for the rounding of the area's name.
+        created.is_none_or(|secs| secs * 1000.0 + 1000.0 > seen.0)
     }
 
     /// Hold `area`'s lock until the returned hold is dropped (or the page goes).
